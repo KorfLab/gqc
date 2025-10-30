@@ -1,7 +1,8 @@
 GQC
 ===
 
-Genome Quality Control
+This project aims to perform simple genome quality control measures on protein
+coding genes.
 
 ## Goal ##
 
