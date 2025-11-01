@@ -253,6 +253,7 @@ def get_genes(db,  seqid=None, source=None, fid=None, pid=None):
 			txos.append(txo)
 		yield Gene(genef, txos)
 
+
 ############################################################################
 # ACTIONS
 ############################################################################
@@ -297,7 +298,6 @@ s1.add_argument('--fasta', metavar='<file.fa>', required=True,
 	help='genome fasta file, compressed ok')
 s1.add_argument('--gff3', metavar='<file.gff3>', required=True,
 	help='genome gff3 file, compressed ok')
-s1.add_argument('--index', action='store_true')
 s1.set_defaults(func=cli_create_database)
 
 ## get sequence using coordinates
