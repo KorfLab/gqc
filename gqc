@@ -42,6 +42,12 @@ def readfasta(filename):
 	yield name, ''.join(seqs)
 	fp.close()
 
+COMPLEMENT = str.maketrans('ACGTRYMKWSBDHV', 'TGCAYRKMWSVHDB')
+
+def anti(seq):
+	"""Returns the reverse complement of a sequence"""
+	anti = seq.translate(COMPLEMENT)[::-1]
+	return anti
 
 ############################################################################
 # CLASS DEFINITIONS
@@ -280,6 +286,20 @@ def cli_get_genes(arg):
 	for gene in get_genes(arg.db):
 		print(gene)
 
+def cli_train_models(arg):
+
+	accs = []
+	dons = []
+	for gene in get_genes(arg.db):
+		for tx in gene.transcripts:
+			for intron in tx.introns:
+				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
+				if intron.strand == '-': iseq = anti(iseq)
+				dons.append(iseq[0:arg.don])
+				accs.append(iseq[-arg.acc:])
+
+#	import isoform
+#	acc = isoform.create_pwm(accs)
 
 ############################################################################
 # CLI
@@ -333,6 +353,18 @@ s5.add_argument('--seq', action='store_true', help='report sequence')
 s5.add_argument('--tx', help='send transcripts to named file')
 s5.add_argument('--cds', help='send CDS to named file')
 s5.set_defaults(func=cli_get_genes)
+
+## get splice sites
+s6 = sub.add_parser('models', help='get splice sites')
+s6.add_argument('--acc', type=int, default=6,
+	help='length of acceptor site [%(default)i]')
+s6.add_argument('--don', type=int, default=5,
+	help='length of donor site [%(default)i]')
+s6.add_argument('--exon', type=int, default=5,
+	help='order of Markov model [%(default)i]')
+s6.add_argument('--intron', type=int, default=5,
+	help='order of Markov model [%(default)i]')
+s6.set_defaults(func=cli_train_models)
 
 ## execute sub-command
 arg = parser.parse_args()
