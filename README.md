@@ -14,4 +14,11 @@ coding genes.
 - Train standard sequence models on genes
 - Use sequence models to score genes
 - Report genome features, patterns, and outliers
+- HTML output?
 - Automate everything
+
+CLI should eventually look like this:
+
+```
+gqc <fasta> <gff> <output dir>
+```
