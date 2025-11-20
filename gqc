@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import sys
+import math
 
 ############################################################################
 # UTILITIES
@@ -48,6 +49,68 @@ def anti(seq):
 	"""Returns the reverse complement of a sequence"""
 	anti = seq.translate(COMPLEMENT)[::-1]
 	return anti
+
+def prob2score(p):
+	"""Convert probability to nucleotide-ish log-odds score"""
+	if p == 0: return -100
+	return math.log2(p/0.25)
+
+############################################################################
+# MARKOV MODEL
+############################################################################
+
+
+def create_markov(seqs, order, beg, end):
+	"""Creates an n-th order Markov model from a list of sequences"""
+	count = {}
+	for seq in seqs:
+		for i in range(beg+order, len(seq) - end):
+			ctx = seq[i-order:i]
+			nt = seq[i]
+			if ctx not in count: count[ctx] = {'A':0, 'C':0, 'G':0, 'T':0}
+			count[ctx][nt] += 1
+
+	# these need to be probabilities
+	mm = {}
+	for kmer in count:
+		mm[kmer] = {}
+		total = 0
+		for nt in count[kmer]: total += count[kmer][nt]
+		for nt in count[kmer]: mm[kmer][nt] = count[kmer][nt] / total
+
+	return mm
+
+def write_markov(file, mm):
+	"""Writes an n-th order Markov model to a named file"""
+	with open(file, 'w') as fp:
+		fp.write(f'% MM {file} {len(mm)*4}\n')
+		for kmer in sorted(mm):
+			for v in mm[kmer]:
+				fp.write(f'{kmer}{v} {mm[kmer][v]:.6f}\n')
+			fp.write('\n')
+
+def read_markov(file):
+	"""Reads an n-th order Markov model from a named file"""
+	mm = {}
+	k = None
+	with open(file) as fp:
+		for line in fp:
+			if line.startswith('%'): continue
+			f = line.split()
+			if len(f) == 2:
+				mm[f[0]] = prob2score(float(f[1]))
+				if k == None: k = len(f[0])
+	return {'k': k, 'mm': mm}
+
+def score_markov(model, seq):
+	"""Scores an n-th order Markov model against a sequence"""
+	score = 0
+	k = model['k']
+	mm = model['mm']
+	for i in range(0, len(seq) -k + 1):
+		kmer = seq[i:i+k]
+		score += mm[kmer]
+	return score
 
 ############################################################################
 # CLASS DEFINITIONS
@@ -209,7 +272,7 @@ def get_seq(db, seqid, beg=None, end=None):
 		length = end - beg + 1
 		qseq = f'substr(seq, {offset}, {length})'
 
-	query = f'SELECT {qseq} FROM sequence WHERE seqid="{seqid}"';
+	query = f'SELECT {qseq} FROM sequence WHERE seqid="{seqid}"'
 	seq = cur.execute(query).fetchone()[0]
 	return seq
 
@@ -287,7 +350,6 @@ def cli_get_genes(arg):
 		print(gene)
 
 def cli_train_models(arg):
-
 	accs = []
 	dons = []
 	for gene in get_genes(arg.db):
@@ -297,6 +359,32 @@ def cli_train_models(arg):
 				if intron.strand == '-': iseq = anti(iseq)
 				dons.append(iseq[0:arg.don])
 				accs.append(iseq[-arg.acc:])
+
+def cli_find_bad_genes(arg):
+	baseline = 0
+
+	badgenes = []
+	mmexon = read_markov(arg.mmexon)
+	mmintron = read_markov(arg.mmintron)
+	for gene in get_genes(arg.db):
+		for tx in gene.transcripts:
+			score = 0
+			for exon in tx.introns:
+				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
+				score += score_markov(mmexon, eseq)
+			for intron in tx.introns:
+				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
+				score += score_markov(mmintron, iseq)
+			if score < 0:
+				badgenes.append((tx,score))
+
+	badgenes.sort(key=lambda tup:tup[1],reverse=True)
+	for tx, score in badgenes:
+		print(f'{tx}   \t{score}')
+	
+def cli_make_markov(arg):
+	model = create_markov([arg.db.introns+arg.db.exons], arg.o, 0, 0)
+	write_markov('markov.mm', model)
 
 #	import isoform
 #	acc = isoform.create_pwm(accs)
@@ -365,6 +453,19 @@ s6.add_argument('--exon', type=int, default=5,
 s6.add_argument('--intron', type=int, default=5,
 	help='order of Markov model [%(default)i]')
 s6.set_defaults(func=cli_train_models)
+
+## score markov
+s7 = sub.add_parser('findbgs', help='get unlikely transcripts')
+s7.add_argument('--mmexon')
+s7.add_argument('--mmintron')
+s7.set_defaults(func=cli_find_bad_genes)
+
+## create markov model
+s8 = sub.add_parser('markov', help='get markov model')
+s8.add_argument('--o', type=int, default=4, help='markov model order')
+s8.add_argument('--exon',type=bool,default=False)
+s8.add_argument('--intron',type=bool,default=False)
+s8.set_defaults(func=cli_make_markov)
 
 ## execute sub-command
 arg = parser.parse_args()
