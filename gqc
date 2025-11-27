@@ -361,15 +361,27 @@ def cli_train_models(arg):
 				accs.append(iseq[-arg.acc:])
 
 def cli_find_bad_genes(arg):
-	baseline = 0
-
 	badgenes = []
-	mmexon = read_markov(arg.mmexon)
-	mmintron = read_markov(arg.mmintron)
+	eseqs = []
+	iseqs = []
+
 	for gene in get_genes(arg.db):
 		for tx in gene.transcripts:
 			score = 0
-			for exon in tx.introns:
+			for exon in tx.exons:
+				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
+				eseqs.append(eseq)
+			for intron in tx.introns:
+				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
+				iseqs.append(iseq)
+				
+	mmexon = create_markov(eseqs, 3, 0, 0)
+	mmintron = create_markov(iseqs, 3, 0 ,0)
+
+	for gene in get_genes(arg.db):
+		for tx in gene.transcripts:
+			score = 0
+			for exon in tx.exons:
 				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
 				score += score_markov(mmexon, eseq)
 			for intron in tx.introns:
@@ -381,10 +393,6 @@ def cli_find_bad_genes(arg):
 	badgenes.sort(key=lambda tup:tup[1],reverse=True)
 	for tx, score in badgenes:
 		print(f'{tx}   \t{score}')
-	
-def cli_make_markov(arg):
-	model = create_markov([arg.db.introns+arg.db.exons], arg.o, 0, 0)
-	write_markov('markov.mm', model)
 
 #	import isoform
 #	acc = isoform.create_pwm(accs)
@@ -456,16 +464,7 @@ s6.set_defaults(func=cli_train_models)
 
 ## score markov
 s7 = sub.add_parser('findbgs', help='get unlikely transcripts')
-s7.add_argument('--mmexon')
-s7.add_argument('--mmintron')
 s7.set_defaults(func=cli_find_bad_genes)
-
-## create markov model
-s8 = sub.add_parser('markov', help='get markov model')
-s8.add_argument('--o', type=int, default=4, help='markov model order')
-s8.add_argument('--exon',type=bool,default=False)
-s8.add_argument('--intron',type=bool,default=False)
-s8.set_defaults(func=cli_make_markov)
 
 ## execute sub-command
 arg = parser.parse_args()
