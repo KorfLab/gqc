@@ -59,58 +59,65 @@ def prob2score(p):
 # MARKOV MODEL
 ############################################################################
 
+class Model:
 
-def create_markov(seqs, order, beg, end):
-	"""Creates an n-th order Markov model from a list of sequences"""
-	count = {}
-	for seq in seqs:
-		for i in range(beg+order, len(seq) - end):
-			ctx = seq[i-order:i]
-			nt = seq[i]
-			if ctx not in count: count[ctx] = {'A':0, 'C':0, 'G':0, 'T':0}
-			count[ctx][nt] += 1
+	def ___init___(self):
+		self.k = None
+		self.probs = {}
 
-	# these need to be probabilities
-	mm = {}
-	for kmer in count:
-		mm[kmer] = {}
-		total = 0
-		for nt in count[kmer]: total += count[kmer][nt]
-		for nt in count[kmer]: mm[kmer][nt] = count[kmer][nt] / total
+	def create(self, seqs, beg, end, k=3):
+		"""Creates a model from a sequence"""
+		self.k = k
+		count = {}
+		for seq in seqs:
+			for i in range(beg+k, len(seq) - end):
+				ctx = seq[i-k:i]
+				nt = seq[i]
+				if ctx not in count: count[ctx] = {'A':0, 'C':0, 'G':0, 'T':0}
+				count[ctx][nt] += 1
 
-	return mm
+		mm = {}
+		for kmer in count:
+			mm[kmer] = {}
+			total = 0
+			for nt in count[kmer]: total += count[kmer][nt]
+			for nt in count[kmer]: mm[kmer][nt] = count[kmer][nt] / total
+		self.probs = mm
 
-def write_markov(file, mm):
-	"""Writes an n-th order Markov model to a named file"""
-	with open(file, 'w') as fp:
-		fp.write(f'% MM {file} {len(mm)*4}\n')
-		for kmer in sorted(mm):
-			for v in mm[kmer]:
-				fp.write(f'{kmer}{v} {mm[kmer][v]:.6f}\n')
-			fp.write('\n')
+	def score(self, seq):
+		"""Scores the model against a sequence"""
+		score = 0
+		k = self.k
+		mm = self.probs
+		for i in range(k, len(seq)):
+			kmer = seq[i-k:i]
+			query = seq[i]
+			score += mm[kmer][query]
+		return score
 
-def read_markov(file):
-	"""Reads an n-th order Markov model from a named file"""
-	mm = {}
-	k = None
-	with open(file) as fp:
-		for line in fp:
-			if line.startswith('%'): continue
-			f = line.split()
-			if len(f) == 2:
-				mm[f[0]] = prob2score(float(f[1]))
-				if k == None: k = len(f[0])
-	return {'k': k, 'mm': mm}
+	def export_file(self, file):
+		"""Exports the Markov model to a named file"""
+		mm = self.probs
+		with open(file, 'w') as fp:
+			fp.write(f'% MM {file} {len(mm)*4}\n')
+			for kmer in sorted(mm):
+				for v in mm[kmer]:
+					fp.write(f'{kmer}{v} {mm[kmer][v]:.6f}\n')
+				fp.write('\n')
 
-def score_markov(model, seq):
-	"""Scores an n-th order Markov model against a sequence"""
-	score = 0
-	k = model['k']
-	mm = model['mm']
-	for i in range(0, len(seq) -k + 1):
-		kmer = seq[i:i+k]
-		score += mm[kmer]
-	return score
+	def import_file(self, file):
+		"""Imports a Markov model from a named file"""
+		mm = {}
+		k = None
+		with open(file) as fp:
+			for line in fp:
+				if line.startswith('%'): continue
+				f = line.split()
+				if len(f) == 2:
+					mm[f[0]] = prob2score(float(f[1]))
+					if k == None: k = len(f[0])
+		self.k = k
+		self.probs = mm
 
 ############################################################################
 # CLASS DEFINITIONS
@@ -177,7 +184,7 @@ class Transcript:
 		self.is_valid = None
 
 	def __str__(self):
-		return f'TXobj: {self.beg}..{self.end}{self.strand} {len(self.cdss)}'
+		return f'TXobj: {self.beg}..{self.end}{self.strand} \t{len(self.cdss)}'
 
 
 ############################################################################
@@ -375,19 +382,21 @@ def cli_find_bad_genes(arg):
 				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
 				iseqs.append(iseq)
 				
-	mmexon = create_markov(eseqs, 3, 0, 0)
-	mmintron = create_markov(iseqs, 3, 0 ,0)
+	mmexon = Model()
+	mmexon.create(eseqs,0,0)
+	mmintron = Model()
+	mmintron.create(iseqs,0,0)
 
 	for gene in get_genes(arg.db):
 		for tx in gene.transcripts:
 			score = 0
 			for exon in tx.exons:
 				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
-				score += score_markov(mmexon, eseq)
+				score += mmexon.score(eseq)
 			for intron in tx.introns:
 				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
-				score += score_markov(mmintron, iseq)
-			if score < 0:
+				score += mmintron.score(iseq)
+			if score > 0:
 				badgenes.append((tx,score))
 
 	badgenes.sort(key=lambda tup:tup[1],reverse=True)
