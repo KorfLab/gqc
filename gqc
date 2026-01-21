@@ -61,7 +61,7 @@ def prob2score(p):
 
 class Model:
 
-	def ___init___(self):
+	def __init__(self):
 		self.k = None
 		self.probs = {}
 
@@ -73,7 +73,9 @@ class Model:
 			for i in range(beg+k, len(seq) - end):
 				ctx = seq[i-k:i]
 				nt = seq[i]
-				if ctx not in count: count[ctx] = {'A':0, 'C':0, 'G':0, 'T':0}
+				# initialize with pseudocounts (Laplace smoothing)
+				if ctx not in count: count[ctx] = {'A':1, 'C':1, 'G':1, 'T':1}
+				if nt not in count[ctx]: count[ctx][nt] = 1
 				count[ctx][nt] += 1
 
 		mm = {}
@@ -92,7 +94,13 @@ class Model:
 		for i in range(k, len(seq)):
 			kmer = seq[i-k:i]
 			query = seq[i]
-			score += mm[kmer][query]
+			ctx = mm.get(kmer)
+			if ctx is None:
+				p = 0.25
+			else:
+				p = ctx.get(query, 0.25)
+			# convert to log-odds
+			score += prob2score(p)
 		return score
 
 	def export_file(self, file):
@@ -107,15 +115,20 @@ class Model:
 
 	def import_file(self, file):
 		"""Imports a Markov model from a named file"""
+		# expect lines of the form '<kmer><nt> <prob>' (same format as export_file)
 		mm = {}
 		k = None
 		with open(file) as fp:
 			for line in fp:
 				if line.startswith('%'): continue
 				f = line.split()
-				if len(f) == 2:
-					mm[f[0]] = prob2score(float(f[1]))
-					if k == None: k = len(f[0])
+				if len(f) != 2: continue
+				key, val = f[0], float(f[1])
+				if len(key) < 2: continue
+				kmer, nt = key[:-1], key[-1]
+				if k is None: k = len(kmer)
+				if kmer not in mm: mm[kmer] = {'A':0, 'C':0, 'G':0, 'T':0}
+				mm[kmer][nt] = val
 		self.k = k
 		self.probs = mm
 
@@ -146,6 +159,7 @@ class Gene:
 	"""represents a gene"""
 	def __init__(self, gf, txs):
 		self.seqid = gf.seqid
+		self.fid = gf.fid
 		self.beg = gf.beg
 		self.end = gf.end
 		self.strand = gf.strand
@@ -169,6 +183,8 @@ class Transcript:
 		self.end = txf.end
 		self.strand = txf.strand
 		self.score = txf.score
+		self.fid = txf.fid
+		self.pid = txf.pid
 
 		# added to transcript
 		self.exons = []
@@ -184,7 +200,8 @@ class Transcript:
 		self.is_valid = None
 
 	def __str__(self):
-		return f'TXobj: {self.beg}..{self.end}{self.strand} \t{len(self.cdss)}'
+		return f'TXobj: {self.seqid}:{self.beg}..{self.end}{self.strand}'
+
 
 
 ############################################################################
@@ -357,54 +374,156 @@ def cli_get_genes(arg):
 		print(gene)
 
 def cli_train_models(arg):
-	accs = []
-	dons = []
+	if arg.verbose:
+		print('Verbose mode enabled for training')
+		print(f'Using DB: {arg.db}')
+		print(f'Force overwrite: {bool(arg.force)}')
+	
+	if arg.force or not os.path.exists('baseline.mm'):
+		print('Training baseline model...')
+		# train baseline from full genome sequences (not feature subsequences)
+		con = sqlite3.connect(arg.db)
+		cur = con.cursor()
+		seqids = [r[0] for r in cur.execute('SELECT seqid FROM sequence').fetchall()]
+		gen_seqs = [get_seq(arg.db, sid) for sid in seqids]
+		mmbase = Model()
+		mmbase.create(seqs=gen_seqs, beg=0, end=0, k=arg.k)
+		mmbase.export_file('baseline.mm')
+		print('Baseline model trained and saved to baseline.mm')
+	else:
+		print('Baseline model already exists; use --f to overwrite')
+	
+	if (not arg.force) and os.path.exists('exon.mm') and os.path.exists('intron.mm'):
+		print('Exon and intron models already exist; use --f to overwrite')
+		return
+		
+	print('Collecting exon and intron sequences...')
+	eseqs = []
+	iseqs = []
 	for gene in get_genes(arg.db):
 		for tx in gene.transcripts:
+			if arg.verbose: print(f'  processing {tx}')
+			for exon in tx.exons:
+				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
+				# orient to + strand for model training
+				if exon.strand == '-':
+					eseq = anti(eseq)
+				eseqs.append(eseq)
+				if arg.verbose: print(f'    exon {exon.beg}-{exon.end} len={len(eseq)}')
 			for intron in tx.introns:
 				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
-				if intron.strand == '-': iseq = anti(iseq)
-				dons.append(iseq[0:arg.don])
-				accs.append(iseq[-arg.acc:])
+				if intron.strand == '-':
+					iseq = anti(iseq)
+				iseqs.append(iseq)
+				if arg.verbose: print(f'    intron {intron.beg}-{intron.end} len={len(iseq)}')
+	if arg.verbose:
+		print(f'Collected {len(eseqs)} exon sequences and {len(iseqs)} intron sequences')
+	
+	print('Training exon model...')
+	mmexon = Model()
+	mmexon.create(eseqs,0,0,k=arg.k)
+	mmexon.export_file('exon.mm')
+	print('Exon model trained and saved to exon.mm')
+
+	print('Training intron model...')
+	mmintron = Model()
+	mmintron.create(iseqs,0,0,k=arg.k)
+	mmintron.export_file('intron.mm')
+	print('Intron model trained and saved to intron.mm')
 
 def cli_find_bad_genes(arg):
 	badgenes = []
-	eseqs = []
-	iseqs = []
 
-	for gene in get_genes(arg.db):
-		for tx in gene.transcripts:
-			score = 0
-			for exon in tx.exons:
-				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
-				eseqs.append(eseq)
-			for intron in tx.introns:
-				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
-				iseqs.append(iseq)
-				
+	if arg.verbose:
+		print('Verbose mode enabled for scoring')
+		print('Loading models: baseline.mm, exon.mm, intron.mm')
+		print(f'Using DB: {arg.db}')
+
+	mmbase = Model()
+	mmbase.import_file('baseline.mm')
+
 	mmexon = Model()
-	mmexon.create(eseqs,0,0)
-	mmintron = Model()
-	mmintron.create(iseqs,0,0)
+	mmexon.import_file('exon.mm')
 
+	mmintron = Model()
+	mmintron.import_file('intron.mm')
+
+	print('Scoring transcripts...')
+	total_tx = 0
 	for gene in get_genes(arg.db):
+		total_tx += len(gene.transcripts)
 		for tx in gene.transcripts:
-			score = 0
+			if arg.verbose: print(f'  scoring {tx}')
+
+			# accumulate raw log-odds scores and position counts to normalize later
+			model_score = 0.0
+			model_pos = 0
+			baseline_score = 0.0
+			baseline_pos = 0
+
 			for exon in tx.exons:
 				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
-				score += mmexon.score(eseq)
+				if exon.strand == '-': eseq = anti(eseq)
+
+				# exon model
+				s = mmexon.score(eseq)
+				p = max(0, len(eseq) - (mmexon.k or 0))
+				model_score += s
+				model_pos += p
+
+				# baseline model
+				sb = mmbase.score(eseq)
+				pb = max(0, len(eseq) - (mmbase.k or 0))
+				baseline_score += sb
+				baseline_pos += pb
+
+				if arg.verbose: print(f'    exon score {s} baseline {sb} positions {p}/{pb}')
 			for intron in tx.introns:
 				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
-				score += mmintron.score(iseq)
-			if score > 0:
-				badgenes.append((tx,score))
+				if intron.strand == '-': iseq = anti(iseq)
 
-	badgenes.sort(key=lambda tup:tup[1],reverse=True)
-	for tx, score in badgenes:
-		print(f'{tx}   \t{score}')
+				# intron model
+				si = mmintron.score(iseq)
+				pi = max(0, len(iseq) - (mmintron.k or 0))
+				model_score += si
+				model_pos += pi
+
+				# baseline model
+				si_b = mmbase.score(iseq)
+				pi_b = max(0, len(iseq) - (mmbase.k or 0))
+				baseline_score += si_b
+				baseline_pos += pi_b
+
+				if arg.verbose: print(f'    intron score {si} baseline {si_b} positions {pi}/{pi_b}')
+
+			# normalize per-position (avoid division by zero)
+			if model_pos == 0 or baseline_pos == 0:
+				continue
+			model_norm = model_score / model_pos
+			baseline_norm = baseline_score / baseline_pos
+
+			if arg.verbose: print(f'  tx norm: model {model_norm:.4f} baseline {baseline_norm:.4f}')
+			
+			# single metric: difference (baseline - model) per-position log-odds
+			diff = baseline_norm - model_norm
+			if diff > 0:
+				badgenes.append((gene, tx, diff))
+	
+	if arg.verbose: print('\nSorting bad genes...')
+	# sort by difference (largest baseline- model first)
+	badgenes.sort(key=lambda tup: tup[2], reverse=True)
+
+	if arg.verbose:
+		print(f'Found {len(badgenes)} unlikely transcripts out of {total_tx} total transcripts')
+
+	print('\nUnlikely transcripts:')
+	for gene, tx, diff in badgenes:
+		print(f'{gene.fid}\t{tx.fid}\t{tx}   \tdiff={diff:.4f}')
 
 #	import isoform
 #	acc = isoform.create_pwm(accs)
+
+		
 
 ############################################################################
 # CLI
@@ -459,21 +578,22 @@ s5.add_argument('--tx', help='send transcripts to named file')
 s5.add_argument('--cds', help='send CDS to named file')
 s5.set_defaults(func=cli_get_genes)
 
-## get splice sites
-s6 = sub.add_parser('models', help='get splice sites')
-s6.add_argument('--acc', type=int, default=6,
-	help='length of acceptor site [%(default)i]')
-s6.add_argument('--don', type=int, default=5,
-	help='length of donor site [%(default)i]')
-s6.add_argument('--exon', type=int, default=5,
-	help='order of Markov model [%(default)i]')
-s6.add_argument('--intron', type=int, default=5,
-	help='order of Markov model [%(default)i]')
+## train models
+s6 = sub.add_parser('models', help='train Markov models')
+s6.add_argument('-f', '--force', action='store_true',
+	help='force overwrite of existing .mm files')
+s6.add_argument('-v', '--verbose', action='store_true',
+	help='verbose output')
+s6.add_argument('-k', type=int, default=3,
+	help='Markov model order [%(default)s]')
 s6.set_defaults(func=cli_train_models)
 
 ## score markov
 s7 = sub.add_parser('findbgs', help='get unlikely transcripts')
+s7.add_argument('-v', '--verbose', action='store_true',
+	help='verbose output')
 s7.set_defaults(func=cli_find_bad_genes)
+
 
 ## execute sub-command
 arg = parser.parse_args()
