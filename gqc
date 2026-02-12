@@ -133,6 +133,61 @@ class Model:
 		self.probs = mm
 
 ############################################################################
+# LENGTH MODEL
+############################################################################
+
+def load_len_model(path):
+	"""
+	Return (probs_dict, fallback_prob) if file exists, else (None, None).
+	probs_dict: {length: probability}
+	fallback_prob: smallest_nonzero_prob / 10 or 1e-9 if none
+	"""
+	try:
+		probs = {}
+		min_nonzero = None
+		with open(path, 'r') as fh:
+			first = fh.readline()
+			if not first:
+				return None, None
+			# If header present ("length" first), iterate remaining lines
+			if first.lstrip().startswith('length'):
+				lines = fh
+			else:
+				# first line was data, parse it and then continue
+				parts = first.strip().split()
+				if len(parts) >= 2:
+					try:
+						l = int(parts[0]); p = float(parts[1])
+						probs[l] = p
+						if p > 0 and (min_nonzero is None or p < min_nonzero):
+							min_nonzero = p
+					except Exception:
+						# malformed first line – treat as no model
+						return None, None
+				lines = fh
+			for line in lines:
+				line = line.strip()
+				if not line:
+					continue
+				parts = line.split()
+				if len(parts) < 2:
+					continue
+				try:
+					l = int(parts[0])
+					p = float(parts[1])
+				except Exception:
+					continue
+				probs[l] = p
+				if p > 0 and (min_nonzero is None or p < min_nonzero):
+					min_nonzero = p
+		if not probs:
+			return None, None
+		fallback = (min_nonzero / 10.0) if min_nonzero and min_nonzero > 0.0 else 1e-9
+		return probs, fallback
+	except FileNotFoundError:
+		return None, None
+
+############################################################################
 # CLASS DEFINITIONS
 ############################################################################
 
@@ -198,6 +253,15 @@ class Transcript:
 		self.is_coding = None
 		self.is_spliced = None
 		self.is_valid = None
+
+		# finalize function here
+		self.finalize()
+
+	def finalize(self):
+		# calculate self.is_coding
+		self.is_coding = True if self.cdss else False
+		# calculate self.is_spliced
+		self.is_spliced = True if self.introns else False
 
 	def __str__(self):
 		return f'TXobj: {self.seqid}:{self.beg}..{self.end}{self.strand}'
@@ -300,6 +364,15 @@ def get_seq(db, seqid, beg=None, end=None):
 	seq = cur.execute(query).fetchone()[0]
 	return seq
 
+def get_all_sequences(db):
+	"""Yield (seqid, seq) for all entries in the sequence table"""
+	if not os.path.exists(db): sys.exit(f'aborting: no database {db}')
+	con = sqlite3.connect(db)
+	cur = con.cursor()
+	for row in cur.execute('SELECT seqid, seq FROM sequence'):
+		yield row[0], row[1]
+	con.close()
+
 def get_features(db, seqid=None, ftype=None, source=None, fid=None, pid=None):
 	"""retrieve features with filters"""
 
@@ -343,6 +416,12 @@ def get_genes(db,  seqid=None, source=None, fid=None, pid=None):
 				elif f.type == 'five_prime_UTR': txo.utr5s.append(f)
 				elif f.type == 'three_prime_UTR': txo.utr3s.append(f)
 				else: sys.exit(f'unknown ftype for tx: {f.type}')
+			
+			if len(txo.cdss) > 0: txo.is_coding = True
+			else: txo.is_coding = False
+
+			txo.is_spliced = True if txo.introns else False
+
 			txos.append(txo)
 		yield Gene(genef, txos)
 
@@ -373,64 +452,127 @@ def cli_get_genes(arg):
 	for gene in get_genes(arg.db):
 		print(gene)
 
+
 def cli_train_models(arg):
 	if arg.verbose:
 		print('Verbose mode enabled for training')
 		print(f'Using DB: {arg.db}')
 		print(f'Force overwrite: {bool(arg.force)}')
-	
+
+	# training the baseline model
 	if arg.force or not os.path.exists('baseline.mm'):
+		if arg.verbose:
+			print('Collecting genome sequences...')
+
+		gen_seqs = []
+		for seqid, seq in get_all_sequences(arg.db):
+			gen_seqs.append(seq)
+			if arg.verbose:
+				print(f'  adding sequence {seqid} len={len(seq)}')
+
 		print('Training baseline model...')
-		# train baseline from full genome sequences (not feature subsequences)
-		con = sqlite3.connect(arg.db)
-		cur = con.cursor()
-		seqids = [r[0] for r in cur.execute('SELECT seqid FROM sequence').fetchall()]
-		gen_seqs = [get_seq(arg.db, sid) for sid in seqids]
 		mmbase = Model()
 		mmbase.create(seqs=gen_seqs, beg=0, end=0, k=arg.k)
 		mmbase.export_file('baseline.mm')
 		print('Baseline model trained and saved to baseline.mm')
 	else:
 		print('Baseline model already exists; use --f to overwrite')
-	
-	if (not arg.force) and os.path.exists('exon.mm') and os.path.exists('intron.mm'):
-		print('Exon and intron models already exist; use --f to overwrite')
-		return
-		
-	print('Collecting exon and intron sequences...')
-	eseqs = []
-	iseqs = []
-	for gene in get_genes(arg.db):
-		for tx in gene.transcripts:
-			if arg.verbose: print(f'  processing {tx}')
-			for exon in tx.exons:
-				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
-				# orient to + strand for model training
-				if exon.strand == '-':
-					eseq = anti(eseq)
-				eseqs.append(eseq)
-				if arg.verbose: print(f'    exon {exon.beg}-{exon.end} len={len(eseq)}')
-			for intron in tx.introns:
-				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
-				if intron.strand == '-':
-					iseq = anti(iseq)
-				iseqs.append(iseq)
-				if arg.verbose: print(f'    intron {intron.beg}-{intron.end} len={len(iseq)}')
-	if arg.verbose:
-		print(f'Collected {len(eseqs)} exon sequences and {len(iseqs)} intron sequences')
-	
-	print('Training exon model...')
-	mmexon = Model()
-	mmexon.create(eseqs,0,0,k=arg.k)
-	mmexon.export_file('exon.mm')
-	print('Exon model trained and saved to exon.mm')
 
-	print('Training intron model...')
-	mmintron = Model()
-	mmintron.create(iseqs,0,0,k=arg.k)
-	mmintron.export_file('intron.mm')
-	print('Intron model trained and saved to intron.mm')
+	# defining the features and their corresponding output files 
+	feature_configs = [
+		('exon',    'exons',   'exon.mm',  'exon.len'),
+		('intron',  'introns', 'intron.mm','intron.len'),
+		("5' UTR",  'utr5s',   '5utr.mm',  '5utr.len'),
+		("3' UTR",  'utr3s',   '3utr.mm',  '3utr.len'),
+	]
 
+	# prepare sequence buckets
+	sequences = {name: [] for name, *_ in feature_configs}
+
+	# Determine, per-feature, whether each output file needs building
+	features_needed = {}
+	for name, _, mm_file, len_file in feature_configs:
+		need_len = arg.force or not os.path.exists(len_file)
+		need_mm = arg.force or not os.path.exists(mm_file)
+		features_needed[name] = {
+			'len': need_len,
+			'mm': need_mm,
+			'any': need_len or need_mm
+		}
+
+	# If none of the features need anything, skip collection entirely.
+	if not any(info['any'] for info in features_needed.values()):
+		print('Exon, intron, and UTR models already exist; use --f to overwrite')
+	else:
+		print('Collecting exon, intron, and UTR sequences...')
+
+		# collect sequences
+		for gene in get_genes(arg.db):
+			for tx in gene.transcripts:
+				if arg.verbose:
+					print(f'  processing {tx}')
+				for name, attr, _, _ in feature_configs:
+					if not features_needed[name]['any']:
+						continue
+					for feat in getattr(tx, attr):
+						seq = get_seq(arg.db, feat.seqid, beg=feat.beg, end=feat.end)
+						if feat.strand == '-':
+							seq = anti(seq)
+						sequences[name].append(seq)
+						if arg.verbose:
+							print(f'    {name} {feat.beg}-{feat.end} len={len(seq)}')
+
+		if arg.verbose:
+			total_utrs = len(sequences["5' UTR"]) + len(sequences["3' UTR"])
+			print(
+				f'Collected {len(sequences["exon"])} exon sequences, '
+				f'{len(sequences["intron"])} intron sequences, '
+				f'and {total_utrs} UTR sequences'
+			)
+
+	# traing the models for each feature type
+	for display_name, _, mm_file, len_file in feature_configs:
+		seqs = sequences[display_name]
+		total_sequences = len(seqs)
+
+		# length models
+		if features_needed[display_name]['len']:
+			if total_sequences > 0:
+				if arg.verbose:
+					print(f'Calculating {display_name} length distribution...')
+				length_counts = {}
+				for seq in seqs:
+					l = len(seq)
+					length_counts[l] = length_counts.get(l, 0) + 1
+				with open(len_file, 'w') as f:
+					f.write('length\tprobability\n')
+					for l in sorted(length_counts):
+						f.write(f'{l}\t{length_counts[l] / total_sequences:.6f}\n')
+				if arg.verbose:
+					print(f'  {display_name} length distribution saved to {len_file}')
+			else:
+				if arg.verbose:
+					print(f'  no sequences collected for {display_name}, skipping length model')
+		else:
+			if arg.verbose:
+				print(f'{display_name.capitalize()} length model already exists; use -f to overwrite')
+
+		# Markov models
+		if features_needed[display_name]['mm']:
+			if total_sequences > 0:
+				print(f'Training {display_name} model...')
+				mm = Model()
+				mm.create(seqs, 0, 0, k=arg.k)
+				mm.export_file(mm_file)
+				print(f'{display_name.capitalize()} model trained and saved to {mm_file}')
+			else:
+				print(f'No sequences for {display_name}; skipping {display_name} model')
+		else:
+			print(f'{display_name.capitalize()} model already exists; use -f to overwrite')
+
+	print('\nModel training complete.')
+
+	
 def cli_find_bad_genes(arg):
 	badgenes = []
 
@@ -439,89 +581,190 @@ def cli_find_bad_genes(arg):
 		print('Loading models: baseline.mm, exon.mm, intron.mm')
 		print(f'Using DB: {arg.db}')
 
-	mmbase = Model()
-	mmbase.import_file('baseline.mm')
+	# load markov models
+	mmbase = Model();   mmbase.import_file('baseline.mm')
+	mmexon = Model();   mmexon.import_file('exon.mm')
+	mmintron = Model(); mmintron.import_file('intron.mm')
+	mm5utr = Model();   mm5utr.import_file('5utr.mm')
+	mm3utr = Model();   mm3utr.import_file('3utr.mm')
 
-	mmexon = Model()
-	mmexon.import_file('exon.mm')
+	# mapping feature display name to len model filename
+	len_files = {
+		'exon': 'exon.len',
+		'intron': 'intron.len',
+		"5' UTR": '5utr.len',
+		"3' UTR": '3utr.len'
+	}
 
-	mmintron = Model()
-	mmintron.import_file('intron.mm')
+	# load each .len model
+	len_models = {}
+	for name, path in len_files.items():
+		probs, fallback = load_len_model(path)
+		len_models[name] = {
+			'probs': probs,
+			'fallback': fallback
+		}
+		if arg.verbose:
+			if probs is not None:
+				print(f'Loaded length model for {name} from {path} ({len(probs)} lengths, fallback={fallback})')
+			else:
+				print(f'No length model found for {name} (expected {path}); length-based scoring for this feature will be skipped')
 
 	print('Scoring transcripts...')
 	total_tx = 0
 	for gene in get_genes(arg.db):
 		total_tx += len(gene.transcripts)
 		for tx in gene.transcripts:
-			if arg.verbose: print(f'  scoring {tx}')
-
-			# accumulate raw log-odds scores and position counts to normalize later
-			model_score = 0.0
-			model_pos = 0
-			baseline_score = 0.0
-			baseline_pos = 0
-
-			for exon in tx.exons:
-				eseq = get_seq(arg.db, exon.seqid, beg=exon.beg, end=exon.end)
-				if exon.strand == '-': eseq = anti(eseq)
-
-				# exon model
-				s = mmexon.score(eseq)
-				p = max(0, len(eseq) - (mmexon.k or 0))
-				model_score += s
-				model_pos += p
-
-				# baseline model
-				sb = mmbase.score(eseq)
-				pb = max(0, len(eseq) - (mmbase.k or 0))
-				baseline_score += sb
-				baseline_pos += pb
-
-				if arg.verbose: print(f'    exon score {s} baseline {sb} positions {p}/{pb}')
-			for intron in tx.introns:
-				iseq = get_seq(arg.db, intron.seqid, beg=intron.beg, end=intron.end)
-				if intron.strand == '-': iseq = anti(iseq)
-
-				# intron model
-				si = mmintron.score(iseq)
-				pi = max(0, len(iseq) - (mmintron.k or 0))
-				model_score += si
-				model_pos += pi
-
-				# baseline model
-				si_b = mmbase.score(iseq)
-				pi_b = max(0, len(iseq) - (mmbase.k or 0))
-				baseline_score += si_b
-				baseline_pos += pi_b
-
-				if arg.verbose: print(f'    intron score {si} baseline {si_b} positions {pi}/{pi_b}')
-
-			# normalize per-position (avoid division by zero)
-			if model_pos == 0 or baseline_pos == 0:
+			# skip non-coding transcripts as before
+			if tx.is_coding == False:
 				continue
-			model_norm = model_score / model_pos
-			baseline_norm = baseline_score / baseline_pos
 
-			if arg.verbose: print(f'  tx norm: model {model_norm:.4f} baseline {baseline_norm:.4f}')
-			
-			# single metric: difference (baseline - model) per-position log-odds
-			diff = baseline_norm - model_norm
-			if diff > 0:
-				badgenes.append((gene, tx, diff))
-	
-	if arg.verbose: print('\nSorting bad genes...')
-	# sort by difference (largest baseline- model first)
+			if arg.verbose:
+				print(f'  scoring {tx}')
+
+			# scorers and position counters for overall and per-feature
+			total_model_score = total_model_pos = total_baseline_score = total_baseline_pos = 0.0
+			exon_model_score = exon_model_pos = exon_baseline_score = exon_baseline_pos = 0.0
+			intron_model_score = intron_model_pos = intron_baseline_score = intron_baseline_pos = 0.0
+			utrs_model_score = utrs_model_pos = utrs_baseline_score = utrs_baseline_pos = 0.0
+			length_score = 0.0
+
+			# feature -> (features_list, model_object, display_name)
+			features_and_models = [
+				(tx.exons, mmexon, 'exon'),
+				(tx.introns, mmintron, 'intron'),
+				(tx.utr5s, mm5utr, "5' UTR"),
+				(tx.utr3s, mm3utr, "3' UTR"),
+			]
+
+			for features, model, name in features_and_models:
+				for feat in features:
+					seq = get_seq(arg.db, feat.seqid, beg=feat.beg, end=feat.end)
+					if feat.strand == '-':
+						seq = anti(seq)
+
+					# Markov model score for this sequence
+					s = model.score(seq)
+					# positions counted as len(seq)-k (floor at 0)
+					p = max(0, len(seq) - (getattr(model, 'k', None) or 0))
+
+					# Baseline for this sequence
+					s_b = mmbase.score(seq)
+					p_b = max(0, len(seq) - (getattr(mmbase, 'k', None) or 0))
+
+					# Aggregate into overall totals
+					total_model_score += s
+					total_model_pos += p
+					total_baseline_score += s_b
+					total_baseline_pos += p_b
+
+					# Aggregate into feature-specific totals
+					if name == 'exon':
+						exon_model_score += s
+						exon_model_pos += p
+						exon_baseline_score += s_b
+						exon_baseline_pos += p_b
+					elif name == 'intron':
+						intron_model_score += s
+						intron_model_pos += p
+						intron_baseline_score += s_b
+						intron_baseline_pos += p_b
+					else:  # UTRs (both 5' and 3') are combined into utrs_*
+						utrs_model_score += s
+						utrs_model_pos += p
+						utrs_baseline_score += s_b
+						utrs_baseline_pos += p_b
+
+					# Length-model contribution (if available)
+					len_info = len_models.get(name)
+					if len_info and len_info['probs'] is not None:
+						probs = len_info['probs']
+						fallback = len_info['fallback'] or 1e-9
+						prob = probs.get(len(seq), fallback)
+						if prob <= 0:
+							prob = fallback
+						length_log = math.log(prob)
+						# accumulate across transcript (we'll normalize by total_model_pos later)
+						length_score += length_log
+					else:
+						length_log = 0.0
+
+					if arg.verbose:
+						if length_log != 0.0:
+							print(f'\t{name} score {s:.3f} baseline {s_b:.3f} length_log {length_log:.4f}')
+						else:
+							print(f'\t{name} score {s:.3f} baseline {s_b:.3f} (no length model)')
+
+			# If no positions to normalize on, skip this transcript
+			if total_model_pos == 0 or total_baseline_pos == 0:
+				if arg.verbose:
+					print(f'  skipping {tx} (no scoring positions)')
+				continue
+
+			# Normalize overall
+			model_norm = total_model_score / total_model_pos
+			baseline_norm = total_baseline_score / total_baseline_pos
+
+			# Per-feature normalized values (only if positions > 0)
+			def safe_norm(score, pos):
+				return (score / pos) if pos > 0 else None
+
+			exon_model_norm = safe_norm(exon_model_score, exon_model_pos)
+			exon_baseline_norm = safe_norm(exon_baseline_score, exon_baseline_pos)
+
+			intron_model_norm = safe_norm(intron_model_score, intron_model_pos)
+			intron_baseline_norm = safe_norm(intron_baseline_score, intron_baseline_pos)
+
+			utrs_model_norm = safe_norm(utrs_model_score, utrs_model_pos)
+			utrs_baseline_norm = safe_norm(utrs_baseline_score, utrs_baseline_pos)
+
+			# Length contribution normalized per overall model positions
+			# (baseline has no length contribution, so baseline_length_norm = 0)
+			length_norm = length_score / total_model_pos  # can be negative
+			length_baseline_norm = 0.0
+			length_diff = length_baseline_norm - length_norm  # baseline - length
+
+			# Per-feature diffs (baseline - model); None if unavailable
+			exon_diff = (exon_baseline_norm - exon_model_norm) if (exon_baseline_norm is not None and exon_model_norm is not None) else None
+			intron_diff = (intron_baseline_norm - intron_model_norm) if (intron_baseline_norm is not None and intron_model_norm is not None) else None
+			utrs_diff = (utrs_baseline_norm - utrs_model_norm) if (utrs_baseline_norm is not None and utrs_model_norm is not None) else None
+
+			# Overall diff (as before)
+			overall_diff = baseline_norm - model_norm
+
+			if arg.verbose:
+				print(f'  tx norm: model {model_norm:.4f} baseline {baseline_norm:.4f} overall_diff {overall_diff:.4f}')
+				# optionally print per-feature diffs
+				if exon_diff is not None: print(f'    exon_diff {exon_diff:.4f}')
+				if intron_diff is not None: print(f'    intron_diff {intron_diff:.4f}')
+				if utrs_diff is not None: print(f'    utrs_diff {utrs_diff:.4f}')
+				print(f'    length_diff {length_diff:.4f}')
+
+			# Append to bad list if overall_diff > 0 (same as before)
+			if overall_diff > 0:
+				# store the diffs so report can include them
+				badgenes.append((
+					gene, tx, overall_diff,
+					exon_diff, intron_diff, utrs_diff, length_diff
+				))
+
+	if arg.verbose:
+		print('\nSorting bad genes...')
+	# sort by overall difference (largest baseline - model first)
 	badgenes.sort(key=lambda tup: tup[2], reverse=True)
 
 	if arg.verbose:
 		print(f'Found {len(badgenes)} unlikely transcripts out of {total_tx} total transcripts')
 
-	print('\nUnlikely transcripts:')
-	for gene, tx, diff in badgenes:
-		print(f'{gene.fid}\t{tx.fid}\t{tx}   \tdiff={diff:.4f}')
-
-#	import isoform
-#	acc = isoform.create_pwm(accs)
+	# write out bad genes to a report file with per-component columns
+	with open('badgenes.txt', 'w') as f:
+		f.write('Unlikely Transcripts Report\n')
+		f.write('============================\n')
+		f.write('GeneID\tTranscriptID\tScoreDiff\texon_diff\tintron_diff\tutrs_diff\tlength_diff\n')
+		for gene, tx, diff, exon_d, intron_d, utrs_d, length_d in badgenes:
+			# format diffs: empty string when None
+			fmt = lambda x: f'{x:.4f}' if x is not None else '.'
+			f.write(f'{gene.fid}\t{tx.fid}\t{diff:.4f}\t{fmt(exon_d)}\t{fmt(intron_d)}\t{fmt(utrs_d)}\t{fmt(length_d)}\n')
 
 		
 
@@ -593,7 +836,6 @@ s7 = sub.add_parser('findbgs', help='get unlikely transcripts')
 s7.add_argument('-v', '--verbose', action='store_true',
 	help='verbose output')
 s7.set_defaults(func=cli_find_bad_genes)
-
 
 ## execute sub-command
 arg = parser.parse_args()
