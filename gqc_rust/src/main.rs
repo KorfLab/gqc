@@ -90,7 +90,7 @@ impl GenomeData {
 
     fn load_gff3(&mut self, path: &str, v: bool) {
         if v { println!("  [Verbose] Parsing GFF3: {}", path); }
-        let reader = gegt_reader(path);
+        let reader = get_reader(path);
         let mut features_by_pid: HashMap<String, Vec<Feature>> = HashMap::new();
         let mut genes_raw = Vec::new();
 
